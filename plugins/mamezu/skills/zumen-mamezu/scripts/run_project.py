@@ -98,6 +98,74 @@ for pno in range(len(L.doc)):
             for n in r.get('notes', []):
                 report.append(f"{sheet_no(pno)}：{name}：{n}")
 
+# ---- 赤枠の図（一覧表でない図：要領図など）。赤枠の内側を、文字ごと切り出す
+def table_box(tb):
+    right = max([b for a, b in tb.cols] or [tb.x1])
+    bottom = max([r.y1 for r in tb.rows] or [tb.head[1]])
+    return pymupdf.Rect(tb.x0, tb.head[0], right, bottom)
+
+
+def red_frames(pno):
+    p = L.doc[pno]
+    M = p.rotation_matrix
+    out = []
+    for dr in p.get_drawings():
+        c = dr.get('color')
+        if not c or not (c[0] > 0.7 and c[1] < 0.3 and c[2] < 0.3):
+            continue
+        r = dr['rect']
+        r = pymupdf.Rect(r.tl * M, r.br * M).normalize()
+        if r.width > 30 and r.height > 30:
+            out.append(r)
+    return out
+
+
+for pno in range(len(L.doc)):
+    frames = red_frames(pno)
+    if not frames:
+        continue
+    pg = L.page(pno)
+    tbs = [(tb, table_box(tb)) for tb in L.find_tables(pno)]
+    for fr in frames:
+        # 表の中の赤枠（符号・欄の目印）は、表の切り出しで足りるので飛ばす
+        if any((fr & bx).get_area() > fr.get_area() * 0.3 for tb, bx in tbs):
+            continue
+        ws = pg.words_in(fr.x0, fr.y0, fr.x1, fr.y1)
+        if not ws:
+            continue
+        lines = {}
+        for rr, t in ws:
+            lines.setdefault(round(rr.y0 / 3), []).append((rr.x0, rr.x1, t))
+        texts = []
+        for k, v in sorted(lines.items()):
+            seg, last = '', None
+            for x0, x1, t in sorted(v):
+                if last is not None and x0 - last > 15:  # 同じ高さでも、離れている文字は別の注記
+                    texts.append(squash(seg))
+                    seg = ''
+                seg += t
+                last = x1
+            texts.append(squash(seg))
+        title = texts[0]
+        name = re.sub(r'[\\/:*?"<>|]', '', title)[:30]
+        # まとまり：いちばん近い表のまとまり
+        best = None
+        for tb, bx in tbs:
+            g, _ = group_of(tb)
+            if g is None:
+                g = {'wall': '壁', 'column': '柱'}.get(tb.kind, page_group.get(pno))
+            d = abs((bx.x0 + bx.x1) / 2 - (fr.x0 + fr.x1) / 2) + abs((bx.y0 + bx.y1) / 2 - (fr.y0 + fr.y1) / 2)
+            if g in GROUPS and g != 'スラブ' and (best is None or d < best[0]):
+                best = (d, g)
+        group = best[1] if best else page_group.get(pno)
+        if group is None:
+            report.append(f'{sheet_no(pno)}：赤枠の図「{title}」の、まとまりが分かりませんでした（飛ばしました）')
+            continue
+        body = [t for t in texts[1:] if len(t) >= 6]
+        items.append(dict(group=group, name=name, naiyou='\n'.join([title] + body), order=(1001, (name, 0, ''), fr.x0),
+                          page=pno, cell=(fr.x0, fr.y0, fr.x1, fr.y1), sheet=sheet_no(pno)))
+        report.append(f'{sheet_no(pno)}：赤枠の図「{name}」を、{group}のまとまりに切り出しました（黒板の文字を確認してください）')
+
 # ---- 画像
 ROW_UNIT, PAD_UNIT = 0.075, 0.18
 

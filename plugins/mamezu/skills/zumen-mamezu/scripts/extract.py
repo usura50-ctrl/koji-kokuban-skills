@@ -1,10 +1,13 @@
 """一覧表（listkit が見つけた表）から、符号・階・位置ごとの記録を取り出し、黒板の文字を作る。"""
 import re
 
+import numpy as np
+
 from cropkit import content_bbox, merged_range
 from listkit import Lists, Row, Table, nfkc, norm_value, squash
 
 JOINT = '仕口'
+HOOP_RE = r'フープ|HOOP|STP|スターラップ|あばら'
 
 
 def floor_of(label):
@@ -84,9 +87,62 @@ def floor_left_of(pg, tb, y0, y1):
     return best[1] if best else ''
 
 
+def box_symbol(pg, ws):
+    """値の左に描かれた帯筋の記号が、□（四角・格子）か。細いフック（コ型・幅止めの1本）なら False。"""
+    main = [rr for rr, t in ws if nfkc(t).startswith('-')]
+    if not main:
+        return True
+    r = main[0]
+    h = r.y1 - r.y0
+    # 罫線を入れないよう、文字の高さの範囲だけを見る。□なら、上下の辺（横に長い線）がある
+    img = pg.px(r.x0 - 1.6 * h, r.y0 - 0.15 * h, r.x0 - 0.05, r.y1 + 0.15 * h)
+    a = np.asarray(img.convert('L')) < 160
+    if not a.any():
+        return True  # 記号が見えない：今までどおり□を補う
+    run = 0
+    for row in a:
+        cur = 0
+        for v in row:
+            cur = cur + 1 if v else 0
+            run = max(run, cur)
+    return run >= a.shape[0] / 1.3 * 0.6
+
+
+def tokki_defaults(pg, tb):
+    """表の上の「特記なき限り」の行から、空欄のときの値（STP・腹筋）を読む。例：STP □-D10@200 , 腹筋 2-D10"""
+    right = tb.cols[-1][1] if tb.cols else tb.x1 + 300
+    cands = [r for r, t in pg.words if '特記なき' in squash(t) and r.y1 <= tb.head[0] + 1 and tb.x0 - 20 <= r.x0 <= right]
+    if not cands:
+        return {}
+    r0 = max(cands, key=lambda r: r.y0)  # 表にいちばん近い（下の）もの
+    nxt = [rr for rr, t in pg.words if rr.y0 > r0.y0 + 3]
+    if not nxt:
+        return {}
+    y = min(rr.y0 for rr in nxt)  # 「特記なき限り」の次の行
+    line = squash(''.join(t for rr, t in sorted(((rr, t) for rr, t in pg.words if abs(rr.y0 - y) < 3 and r0.x0 - 5 <= rr.x0 <= r0.x0 + 700), key=lambda w: w[0].x0)))
+    line = norm_value(line)
+    out = {}
+    m = re.search(r'(?:STP|スターラップ|あばら筋)□?(\d*)-(D\d+@[\d,]+)', line)
+    if m:
+        out['STP'] = f"{m.group(1)}□-{m.group(2).replace(',', '')}"
+    m = re.search(r'腹筋(\d+-D\d+)', line)
+    if m:
+        out['腹筋'] = m.group(1)
+    return out
+
+
+def biko_label(pg):
+    """「備考欄記入寸法は、カットオフ長さLdを示す」のような説明から、備考の数字の意味（カットオフ長さ）を読む。"""
+    t = squash(''.join(t for r, t in sorted(pg.words, key=lambda w: (round(w[0].y0 / 3), w[0].x0))))
+    m = re.search(r'備考欄?の?記入(?:寸法|数値)は、?(.+?)を示す', t)
+    return re.sub(r'[A-Za-z]+$', '', m.group(1)) if m else ''
+
+
 def records(L: Lists, tb: Table):
     pg = L.page(tb.page)
     out = []
+    defaults = tokki_defaults(pg, tb)
+    note_label = biko_label(pg)
     for tall, data, posrow in blocks_of(tb):
         pos_cols = positions_of(L, tb, posrow)
         fl = floor_of(tall.label)
@@ -115,6 +171,7 @@ def records(L: Lists, tb: Table):
                 lone = lambda t: re.fullmatch(r'\d{1,2}', nfkc(t).strip())
                 ys = [rr.y0 for rr, t in ws if not lone(t)]
                 own_cnt = ''
+                left_cnt = ''
                 if ys and len(ws) > 1:
                     base = min(ys)
                     odd = [(rr, t) for rr, t in ws if lone(t) and abs(rr.y0 - base) > 3]
@@ -124,18 +181,32 @@ def records(L: Lists, tb: Table):
                             carry[k - 1] = nfkc(t).strip()  # 前の行の本数が、この行に食い込んでいる
                         else:
                             own_cnt = nfkc(t).strip()
+                    # □の左（本文と同じ高さ）の本数：4⊞-K13@100 の「4」
+                    main = [rr for rr, t in ws if not lone(t)]
+                    lefts = [(rr, t) for rr, t in ws if lone(t) and main and rr.x1 <= min(m.x0 for m in main) + 1]
+                    if lefts and re.search(HOOP_RE, r.label):
+                        left_cnt = nfkc(lefts[0][1]).strip()
+                        ws = [w for w in ws if w not in lefts]
                 txt = norm_value(''.join(t for rr, t in ws))
-                if re.search(r'フープ|HOOP|STP|スターラップ|あばら', r.label):
-                    if own_cnt:
-                        if re.match(r'^-(D\d+|K\d+|U[0-9.]+)', txt):
-                            txt = f'{own_cnt}□' + txt  # 本数は□の前
-                        else:
-                            notes.append(f'{r.label}：{txt} の下に数字 {own_cnt} があります（本数？）')
+                if re.search(HOOP_RE, r.label):
+                    # 本数は□の前。□の左と下の両方に数字があるときは「左×下」（例：4×3□-K13@100）
+                    cnt = '×'.join(c for c in (left_cnt, own_cnt) if c)
+                    if re.match(r'^-(D\d+|K\d+|U[0-9.]+)', txt) and box_symbol(pg, ws):
+                        txt = f'{cnt}□' + txt
+                    elif cnt:
+                        notes.append(f'{r.label}：{txt} の近くに数字 {cnt} があります（本数？）')
                     else:
-                        txt = re.sub(r'(\)|^)(-D\d+|-K\d+|-U[0-9.]+)', lambda m: m.group(1) + '□' + m.group(2), txt)  # 帯筋の記号（□）は図なので、文字に補う
+                        txt = re.sub(r'(\))(-D\d+|-K\d+|-U[0-9.]+)', lambda m: m.group(1) + '□' + m.group(2), txt)  # 帯筋の記号（□）は図なので、文字に補う
                 txt = re.sub(r'(@\d+)([SDC])$', lambda m: m.group(1) + ' ' + m.group(2), txt)  # 壁：D10@200 D（S：シングル・D：ダブル・C：チドリ）
                 if not txt and content_bbox(pg.px(mr[0] + 0.6, r.y0 + 0.6, mr[1] - 0.6, r.y1 - 0.6)) is not None:
                     txt = '—'
+                if re.fullmatch(r'[-‐―—─━]+', txt):
+                    txt = '—'  # 線だけの値（無し）は、同じ記号にそろえる
+                if not txt and r.kind == 'data' and tb.kind == 'beam':
+                    for key, dv in defaults.items():
+                        if key in squash(r.label):
+                            txt = dv
+                            notes.append(f'{r.label}：空欄なので、特記（特記なき限り）の {dv} にしました')
                 if r.kind == 'size' and '上図参照' in txt:
                     nums = sorted({(rr.y0, rr.x0, nfkc(t)) for rr, t in pg.words_in(col[0], tall.y0, col[2] if len(col) > 2 else col[1], tall.y1) if re.fullmatch(r'\d{3}', nfkc(t))})
                     if len(nums) >= 2:
@@ -145,14 +216,14 @@ def records(L: Lists, tb: Table):
                         notes.append(f'寸法「上図参照」を、図の寸法注記から {txt} と読みました')
                 vals.append([r, txt])
             for k, n in carry.items():
-                if 0 <= k < len(vals) and re.search(r'フープ|HOOP|STP|スターラップ|あばら', vals[k][0].label) and vals[k][1].startswith('□'):
+                if 0 <= k < len(vals) and re.search(HOOP_RE, vals[k][0].label) and vals[k][1].startswith('□'):
                     vals[k][1] = n + vals[k][1]
             vals = [tuple(v) for v in vals]
             if not any(v and v != '—' for r, v in vals):
                 continue
             wall_text = ''.join(t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1))
             out.append(dict(table=tb, sym=nfkc(sym), floor=fl, pos=nfkc(pname), vals=vals, cell=(col[0], tall.y0, col[1], tall.y1), page=tb.page,
-                            tall_words=[t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1)], notes=notes))
+                            tall_words=[t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1)], notes=notes, note_label=note_label))
     return out
 
 
@@ -174,22 +245,30 @@ def compose(rec, kind, habadome):
     """黒板の作業内容。項目名は、図面の項目名のまま。"""
     lines = [head_line(rec)]
     wall_open = []
+    notes = []
     seen_labels = set()
     for r, v in rec['vals']:
         if r.kind == 'size' or not v:
+            continue
+        if r.kind == 'note':
+            if v != '—':
+                lab = rec.get('note_label')
+                notes.append(f'{lab} {v}' if lab and re.fullmatch(r'[\d,.]+', v) else v)
             continue
         lab = r.label
         if kind == 'wall' and v == '—' and (lab in ('縦', '横', '斜メ', '斜め', '斜筋', '斜', '縦筋', '横筋') or lab in seen_labels):
             continue
         if kind == 'wall' and (lab in ('縦', '横', '斜メ', '斜め', '斜筋', '斜') or lab in seen_labels):
-            wall_open.append(f"{ {'縦筋': '縦', '横筋': '横', '斜筋': '斜メ', '斜': '斜メ', '斜め': '斜メ'}.get(lab, lab) }{v}")
+            wall_open.append(f"{ {'縦筋': '縦', '横筋': '横', '斜筋': '斜'}.get(lab, lab) }{v}")
             continue
         seen_labels.add(lab)
         lines.append(f'{lab}：{v}')
     if wall_open:
         lines.append('開口部補強筋：' + '　'.join(wall_open))
     if kind in ('beam', 'wall') and habadome:
-        lines.insert(len(lines), f'幅止め筋：{habadome}')
+        lines.append(f'幅止め筋：{habadome}')
+    if notes:
+        lines.append('備考：' + '　'.join(notes))  # 備考は最後（幅止め筋の下）
     if kind == 'wall':
         th = [t for t in rec['tall_words'] if re.fullmatch(r'\d{3}', nfkc(t))]
         if th:
