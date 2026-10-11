@@ -34,7 +34,7 @@ def group_of(tb):
     t = squash(''.join(w for r, w in sorted(pg.words_in(tb.x0 - 5, tb.head[0] - 45, tb.x0 + 330, tb.head[0] - 1), key=lambda a: (round(a[0].y0 / 5), a[0].x0))))
     if 'スラブ' in t:
         return 'スラブ', t
-    if '地中' in t and '梁' in t:
+    if ('地中' in t or '基礎' in t) and '梁' in t:
         return '基礎梁', t
     if '大梁' in t or '小梁' in t or '梁リスト' in t:
         return '梁', t
@@ -52,9 +52,24 @@ def sheet_no(pno):
 
 
 items = []
+page_group = {}
+for pno in range(len(L.doc)):
+    for tb0 in L.find_tables(pno):
+        g0, _ = group_of(tb0)
+        if g0 in ('基礎梁', '柱', '梁', '壁'):
+            page_group.setdefault(pno, g0)
 for pno in range(len(L.doc)):
     for tb in L.find_tables(pno):
         group, title = group_of(tb)
+        if group is None and tb.kind != 'slab':
+            # 題名の無い表（同じページの別の表）：表の種類と、同じページの表から決める
+            pg_g = page_group.get(pno)
+            if tb.kind == 'wall':
+                group = '壁'
+            elif tb.kind == 'column':
+                group = '柱'
+            elif tb.rows and any(rw.kind == 'size' for rw in tb.rows):
+                group = pg_g if pg_g in ('基礎梁', '梁') else '梁'
         if group is None:
             if tb.kind != 'slab' or True:
                 report.append(f'{sheet_no(pno)}：題名が読めない表を飛ばしました（{title[:20] or "題名なし"}）')
@@ -80,6 +95,8 @@ for pno in range(len(L.doc)):
             name = r['sym'] + (f"_{r['floor']}階" if r['floor'] else '') + r['pos']
             items.append(dict(group=group, name=name, naiyou=compose(r, tb.kind, habadome if tb.kind in ('beam', 'wall') else None),
                               order=(floor_key(r['floor']), natural(r['sym']), r['cell'][0]), page=pno, cell=r['cell'], sheet=sheet_no(pno)))
+            for n in r.get('notes', []):
+                report.append(f"{sheet_no(pno)}：{name}：{n}")
 
 # ---- 画像
 ROW_UNIT, PAD_UNIT = 0.075, 0.18

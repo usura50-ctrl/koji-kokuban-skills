@@ -39,7 +39,7 @@ ROW_KINDS = [
     ('joint', r'仕口'),
     ('note', r'^備考'),
 ]
-VOCAB = re.compile(r'(位置|断面|階|b[xX×]D|Dx[xX×]Dy|上端筋|下端筋|スターラップ|STP|あばら筋|腹筋|主筋|フープ|HOOP|縦筋|横筋|開口|補強筋|備考|縦|横|斜メ|斜め|仕口|▽|SL|^[RＲ]$|^[0-9]+$)')
+VOCAB = re.compile(r'(位置|断面|階|b[xX×]D|Dx[xX×]Dy|上端筋|下端筋|スターラップ|STP|あばら筋|腹筋|主筋|フープ|HOOP|縦筋|横筋|開口|補強筋|備考|縦|横|斜メ|斜め|斜筋|斜|端部補強|仕口|▽|SL|^[RＲ]$|^[0-9]+$)')
 
 
 def row_kind(label):
@@ -85,9 +85,16 @@ class Lists:
     def find_tables(self, i):
         pg = self.page(i)
         out = []
+        cands = [r for r, t in pg.words if squash(t) == '符号']
+        # 文字が1字ずつ別の単語になっている図面（「符」「号」）
         for r, t in pg.words:
-            if squash(t) != '符号':
+            if squash(t) != '符':
                 continue
+            for r2, t2 in pg.words:
+                if squash(t2) == '号' and abs(r2.y0 - r.y0) < 2 and 0 <= r2.x0 - r.x1 < 12:
+                    cands.append(r | r2)
+                    break
+        for r in cands:
             tb = self._parse(pg, i, r)
             if tb:
                 out.append(tb)

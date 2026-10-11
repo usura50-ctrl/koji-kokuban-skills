@@ -29,26 +29,29 @@ def blocks_of(tb: Table):
     """断面（背の高い行）から始まるまとまり：[(背の高い行, [データの行])]。"""
     out = []
     cur = None
+    lastpos = None
     for r in tb.rows:
+        if r.kind == 'pos':
+            lastpos = r
         if r.tall and r.kind in ('section', 'floor'):
-            cur = (r, [])
+            cur = (r, [], lastpos)
             out.append(cur)
         elif r.kind in ('joint',):
             cur = None  # 仕口部の行は、その階のものではない（その階だけを切り出す方針）
         elif r.kind == 'level':
             continue
-        elif cur is not None and r.kind in ('data', 'size'):
+        elif cur is not None and r.kind in ('data', 'size', 'note'):
             cur[1].append(r)
     return out
 
 
-def positions_of(L: Lists, tb: Table):
+def positions_of(L: Lists, tb: Table, pos_row=None):
     """位置の列（位置の行の区切り）。位置の行が無い表は、見出しの列がそのまま。"""
     pg = L.page(tb.page)
     pos_rows = [r for r in tb.rows if r.kind == 'pos']
     right = tb.cols[-1][1] if tb.cols else 1e9
     if pos_rows:
-        r = pos_rows[0]
+        r = pos_row or pos_rows[0]
         divs = [x for x in pg.dividers(r.y0 + 0.8, r.y1 - 0.8) if tb.x1 - 0.5 <= x <= right + 0.5]
         cols = list(zip(divs[:-1], divs[1:]))
         names = [squash(''.join(t for rr, t in pg.words_in(a, r.y0, b, r.y1))) for a, b in cols]
@@ -65,14 +68,32 @@ def symbol_of(L, tb, col):
     return ''
 
 
+def floor_left_of(pg, tb, y0, y1):
+    """階の欄が、符号の欄の左に別にある図面（階｜符号）：ブロックの高さの中にある階の文字（8・R・PH）を読む。"""
+    # 見出し（符号の行）の左隣に「階」の欄があるときだけ
+    if not any(squash(t) == '階' for r, t in pg.words_in(tb.x0 - 45, tb.head[0], tb.x0 - 1, tb.head[1])):
+        return ''
+    mid = (y0 + y1) / 2
+    best = None
+    for r, t in pg.words_in(tb.x0 - 45, y0 - 30, tb.x0 - 1, y1 + 15):
+        m = re.fullmatch(r'([0-9]+|[RＲ]|PH|ＰＨ)階?', squash(t))
+        if m:
+            d = abs((r.y0 + r.y1) / 2 - mid)
+            if best is None or d < best[0]:
+                best = (d, nfkc(m.group(1)))
+    return best[1] if best else ''
+
+
 def records(L: Lists, tb: Table):
     pg = L.page(tb.page)
     out = []
-    pos_cols = positions_of(L, tb)
-    for tall, data in blocks_of(tb):
+    for tall, data, posrow in blocks_of(tb):
+        pos_cols = positions_of(L, tb, posrow)
         fl = floor_of(tall.label)
         y_top = tall.y0
         y_bot = data[-1].y1 if data else tall.y1
+        if not fl:
+            fl = floor_left_of(pg, tb, tall.y0, y_bot)
         for col, pname in pos_cols:
             if pname == '' and tb.rows and any(r.kind == 'pos' for r in tb.rows):
                 continue
@@ -85,20 +106,53 @@ def records(L: Lists, tb: Table):
             if pg.has_diagonal(hc[0], y_top, hc[1], y_bot) or pg.has_diagonal(col[0], y_top, col[1], y_bot):
                 continue  # 斜線の欄（その符号・階は無い）
             vals = []
-            for r in data:
+            notes = []
+            carry = {}  # 前の行（STP など）に付く本数の数字
+            for k, r in enumerate(data):
                 mr = merged_range(pg, r.y0, r.y1, col[0], col[1])
-                txt = norm_value(''.join(t for rr, t in pg.words_in(mr[0], r.y0, mr[1], r.y1)))
-                if re.search(r'フープ|HOOP', r.label):
-                    txt = re.sub(r'(\)|^)(-D\d+|-K\d+|-U[0-9.]+)', r'\1□\2', txt)  # 帯筋の記号（□）は図なので、文字に補う
-                txt = re.sub(r'(@\d+)([SDC])$', r'\1 \2', txt)  # 壁：D10@200 D（S：シングル・D：ダブル・C：チドリ）
+                ws = [(rr, t) for rr, t in pg.words_in(mr[0], r.y0, mr[1], r.y1)]
+                # 本数の小さな数字（□の下・上にある1〜2桁）を、本文と分ける
+                lone = lambda t: re.fullmatch(r'\d{1,2}', nfkc(t).strip())
+                ys = [rr.y0 for rr, t in ws if not lone(t)]
+                own_cnt = ''
+                if ys and len(ws) > 1:
+                    base = min(ys)
+                    odd = [(rr, t) for rr, t in ws if lone(t) and abs(rr.y0 - base) > 3]
+                    ws = [w for w in ws if w not in odd]
+                    for rr, t in odd:
+                        if rr.y0 < base - 2:
+                            carry[k - 1] = nfkc(t).strip()  # 前の行の本数が、この行に食い込んでいる
+                        else:
+                            own_cnt = nfkc(t).strip()
+                txt = norm_value(''.join(t for rr, t in ws))
+                if re.search(r'フープ|HOOP|STP|スターラップ|あばら', r.label):
+                    if own_cnt:
+                        if re.match(r'^-(D\d+|K\d+|U[0-9.]+)', txt):
+                            txt = f'{own_cnt}□' + txt  # 本数は□の前
+                        else:
+                            notes.append(f'{r.label}：{txt} の下に数字 {own_cnt} があります（本数？）')
+                    else:
+                        txt = re.sub(r'(\)|^)(-D\d+|-K\d+|-U[0-9.]+)', lambda m: m.group(1) + '□' + m.group(2), txt)  # 帯筋の記号（□）は図なので、文字に補う
+                txt = re.sub(r'(@\d+)([SDC])$', lambda m: m.group(1) + ' ' + m.group(2), txt)  # 壁：D10@200 D（S：シングル・D：ダブル・C：チドリ）
                 if not txt and content_bbox(pg.px(mr[0] + 0.6, r.y0 + 0.6, mr[1] - 0.6, r.y1 - 0.6)) is not None:
                     txt = '—'
-                vals.append((r, txt))
-            if not any(v for r, v in vals):
+                if r.kind == 'size' and '上図参照' in txt:
+                    nums = sorted({(rr.y0, rr.x0, nfkc(t)) for rr, t in pg.words_in(col[0], tall.y0, col[2] if len(col) > 2 else col[1], tall.y1) if re.fullmatch(r'\d{3}', nfkc(t))})
+                    if len(nums) >= 2:
+                        dx = nums[0][2]
+                        rest = sorted(nums[1:], key=lambda a: a[1])
+                        txt = f'{dx}x{rest[0][2]}'
+                        notes.append(f'寸法「上図参照」を、図の寸法注記から {txt} と読みました')
+                vals.append([r, txt])
+            for k, n in carry.items():
+                if 0 <= k < len(vals) and re.search(r'フープ|HOOP|STP|スターラップ|あばら', vals[k][0].label) and vals[k][1].startswith('□'):
+                    vals[k][1] = n + vals[k][1]
+            vals = [tuple(v) for v in vals]
+            if not any(v and v != '—' for r, v in vals):
                 continue
             wall_text = ''.join(t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1))
             out.append(dict(table=tb, sym=nfkc(sym), floor=fl, pos=nfkc(pname), vals=vals, cell=(col[0], tall.y0, col[1], tall.y1), page=tb.page,
-                            tall_words=[t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1)]))
+                            tall_words=[t for rr, t in pg.words_in(col[0], tall.y0, col[1], tall.y1)], notes=notes))
     return out
 
 
@@ -120,13 +174,17 @@ def compose(rec, kind, habadome):
     """黒板の作業内容。項目名は、図面の項目名のまま。"""
     lines = [head_line(rec)]
     wall_open = []
+    seen_labels = set()
     for r, v in rec['vals']:
         if r.kind == 'size' or not v:
             continue
         lab = r.label
-        if kind == 'wall' and lab in ('縦', '横', '斜メ', '斜め'):
-            wall_open.append(f'{lab}{v}')
+        if kind == 'wall' and v == '—' and (lab in ('縦', '横', '斜メ', '斜め', '斜筋', '斜', '縦筋', '横筋') or lab in seen_labels):
             continue
+        if kind == 'wall' and (lab in ('縦', '横', '斜メ', '斜め', '斜筋', '斜') or lab in seen_labels):
+            wall_open.append(f"{ {'縦筋': '縦', '横筋': '横', '斜筋': '斜メ', '斜': '斜メ', '斜め': '斜メ'}.get(lab, lab) }{v}")
+            continue
+        seen_labels.add(lab)
         lines.append(f'{lab}：{v}')
     if wall_open:
         lines.append('開口部補強筋：' + '　'.join(wall_open))
@@ -143,9 +201,9 @@ def find_habadome(L: Lists, hint_pages=None):
     """特記事項の「巾止筋はD10-@1000以内」から、幅止め筋の値を探す。"""
     for i in range(len(L.doc)):
         t = nfkc(L.doc[i].get_text())
-        m = re.search(r'[巾幅]止め?筋[^D]{0,12}(D\d+)[^0-9@]{0,4}@\s*([0-9 ]{3,6})', t)
+        m = re.search(r'[巾幅]止め?筋[^D]{0,12}(D\d+)[^0-9@]{0,4}@\s*([0-9 ,]{3,7})', t)
         if m:
-            return f"{m.group(1)}@{re.sub(r' ', '', m.group(2))}"
+            return f"{m.group(1)}@{re.sub(r'[ ,]', '', m.group(2))}"
     return None
 
 
@@ -192,7 +250,7 @@ def slab_records(L: Lists, tb: Table):
     for h in heads:
         if h.startswith('符号'):
             roles.append('sym')
-        elif re.search(r'版厚|^t|元端|先端', h):
+        elif re.search(r'版厚|厚さ|^t$|元端|先端', h):
             roles.append('thick')
         elif '位置' in h:
             roles.append('pos')
@@ -219,6 +277,7 @@ def slab_records(L: Lists, tb: Table):
                     yc = (y_a + y_b) / 2
                     v = ''.join(t for rr, t in sorted(pg.words_in(a, yc - 5.5, b, yc + 5.5), key=lambda w: w[0].x0))
                     items.append((pname, norm_value(v)))
+                items = [it for it in items if it[1]]
                 rec['vals'].append((h, items))
             elif role == 'note':
                 rec['note'] = norm_value(''.join(t for rr, t in pg.words_in(a, start, b, end)))
