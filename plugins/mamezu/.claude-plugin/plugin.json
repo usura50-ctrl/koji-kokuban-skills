@@ -1,0 +1,6 @@
+{
+  "name": "mamezu",
+  "description": "図面PDFから、符号ごとの豆図（断面の画像）を切り出し、工事黒板アプリ用の黒板Excelを作る",
+  "version": "0.1.0",
+  "author": { "name": "usura50-ctrl" }
+}

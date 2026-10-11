@@ -1,0 +1,11 @@
+{
+  "name": "koji-kokuban-skills",
+  "owner": { "name": "usura50-ctrl" },
+  "plugins": [
+    {
+      "name": "mamezu",
+      "source": "./plugins/mamezu",
+      "description": "図面PDFから、符号ごとの豆図（断面の画像）を切り出し、工事黒板アプリ用の黒板Excelを作る"
+    }
+  ]
+}
